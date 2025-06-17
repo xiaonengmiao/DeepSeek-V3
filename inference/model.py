@@ -1,14 +1,12 @@
 import math
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
+from typing import Literal, Optional, Tuple
 
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
-
-from kernel import act_quant, weight_dequant, fp8_gemm
-
+import torch.nn.functional as F
+from kernel import act_quant, fp8_gemm, weight_dequant
+from torch import nn
 
 world_size = 1
 rank = 0
@@ -794,11 +792,96 @@ class Transformer(nn.Module):
         return logits
 
 
+class SharedHead(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.norm = RMSNorm(args.dim)
+        self.head = torch.nn.Linear(args.dim, args.vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.norm(x))
+
+
+class MTP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.embed_tokens = ParallelEmbedding(args.vocab_size, args.dim)
+        self.enorm = RMSNorm(args.dim)
+        self.hnorm = RMSNorm(args.dim)
+        self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
+        self.shared_head = SharedHead(args)
+        self.decode_layer = Block(61, args)
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    def forward(self, tokens: torch.Tensor, previous_hidden_state: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        seqlen = tokens.size(1)
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        h = self.enorm(self.embed_tokens(tokens))
+        pre_h = self.hnorm(previous_hidden_state)
+        h = torch.cat([h, pre_h], dim=-1)
+        h = self.eh_proj(h)
+        h = self.decode_layer(h, start_pos, freqs_cis, mask)
+        logits = self.shared_head(h)
+        return logits
+
+
 if __name__ == "__main__":
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
-    args = ModelArgs()
-    x = torch.randint(0, args.vocab_size, (2, 128))
-    model = Transformer(args)
+
+    import json
+    import peft
+    from safetensors import safe_open
+    tensors = {}
+    with safe_open("model.safetensors", framework="pt", device="cpu") as f:
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+    state_dict = {k.replace("layers.61.", ""): v for k, v in tensors.items()}
+    with open("config.json", "r") as f:
+        args = ModelArgs(**json.load(f))
+    model = MTP(args)
+    model.load_state_dict(state_dict=state_dict, strict=False)
+    target_modules = []
+    config = peft.LoraConfig(
+        r=32,
+        lora_alpha=64,
+        target_modules=target_modules,
+        lora_dropout=0.05,
+        bias="none",
+    )
+    peft_model = peft.get_peft_model(model, config)
+    peft_model.print_trainable_parameters()
+
+    x = torch.randint(0, args.vocab_size, (2, 128), dtype=torch.int64)
+    pre_h = torch.rand((2, 128, 7168), dtype=torch.bfloat16)
+    X = torch.randint(0, args.vocab_size, (1000, 129), dtype=torch.int64)
+    Y = X[:, 1:]
+    X = X[:, :-1]
+    n_train = 800
+    batch_size = 4
+    train_dataloader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X[:n_train], Y[:n_train]),
+        batch_size=batch_size,
+        shuffle=True,
+    )
+    criterion = torch.nn.SmoothL1Loss(reduction="none")
+    optimizer = torch.optim.AdamW(peft_model.parameters(), lr=1e-3, betas=(0.9, 0.95))
+    for epoch in range(n_train):
+        peft_model.train()
+        total_loss = 0.0
+        for i, (x, y) in enumerate(train_dataloader):
+            x = x.to(torch.bfloat16)
+            y = y.to(torch.bfloat16)
+            pre_h = torch.rand((x.size(0), x.size(1), 7168), dtype=torch.bfloat16)
+            logits = peft_model(x, pre_h)
+            loss = criterion(logits, y)
+            loss = loss.mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
     print(model(x).size())
