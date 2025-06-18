@@ -1835,7 +1835,7 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = DeepseekV3Model(config)
+        self.model = DeepseekV3MTPModel(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
