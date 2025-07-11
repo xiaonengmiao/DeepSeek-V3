@@ -329,6 +329,12 @@ config = peft.LoraConfig(
 )
 model = peft.get_peft_model(model, config)
 model.print_trainable_parameters()
+# from safetensors.torch import load_file, save_file
+# peft_state = load_file("")
+# model.load_state_dict(peft_state, strict=True)
+# model = model.merge_unload()
+# model.save_pretrained("")
+# save_file(model.state_dict(), "")
 
 criterion = torch.nn.SmoothL1Loss(reduction="none")
 optimizer = optim.AdamW(model.parameters(), lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
